@@ -1,0 +1,2 @@
+"""Local image classification package."""
+
