@@ -1,0 +1,18 @@
+[
+  {
+    "type": "correct",
+    "predicted_class": "bibimbap",
+    "confidence": 0.5920588374137878
+  },
+  {
+    "type": "correct",
+    "predicted_class": "beef_carpaccio",
+    "confidence": 0.9895457625389099
+  },
+  {
+    "type": "incorrect",
+    "predicted_class": "caprese_salad",
+    "correct_class": "beef_carpaccio",
+    "confidence": 0.25708678364753723
+  }
+]

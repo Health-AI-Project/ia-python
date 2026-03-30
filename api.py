@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -11,9 +14,12 @@ from pydantic import BaseModel, Field
 from evaluate import evaluate_checkpoint
 from predict import predict_image
 from src.engine import load_checkpoint
+from src.nutrition import estimate_calories_for_class, estimate_weighted_calories
 from train import train_model
 
 app = FastAPI(title="Local Image Classifier API", version="1.0.0")
+PREDICTION_CACHE: dict[str, dict] = {}
+FEEDBACK_LOG_PATH = Path("models/feedback_log.jsonl")
 
 
 class TrainRequest(BaseModel):
@@ -50,6 +56,50 @@ class PredictPathRequest(BaseModel):
     image: str
     image_size: int = Field(default=224, ge=32, le=1024)
     top_k: int = Field(default=3, ge=1, le=20)
+
+
+class FeedbackRequest(BaseModel):
+    prediction_id: str
+    is_correct: bool
+    correct_class: str | None = None
+
+
+def _append_feedback_log(entry: dict) -> None:
+    FEEDBACK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with FEEDBACK_LOG_PATH.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(entry, ensure_ascii=True) + "\n")
+
+
+def _build_prediction_response(result: dict) -> dict:
+    predictions = result.get("predictions", [])
+    if not predictions:
+        raise HTTPException(status_code=400, detail="Prediction failed: no predictions returned")
+
+    best_prediction = predictions[0]
+    top1_calories = estimate_calories_for_class(best_prediction["class_name"])
+    weighted_calories = estimate_weighted_calories(predictions)
+    prediction_id = str(uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    enriched = {
+        "prediction_id": prediction_id,
+        "created_at": created_at,
+        "image": result.get("image"),
+        "checkpoint": result.get("checkpoint"),
+        "predictions": predictions,
+        "top_prediction": best_prediction,
+        "calories": {
+            "top1": top1_calories,
+            "weighted_topk": weighted_calories,
+        },
+    }
+    PREDICTION_CACHE[prediction_id] = {
+        "created_at": created_at,
+        "checkpoint": result.get("checkpoint"),
+        "predicted_class": best_prediction["class_name"],
+        "predictions": predictions,
+    }
+    return enriched
 
 
 def _to_namespace(payload: dict) -> argparse.Namespace:
@@ -120,7 +170,8 @@ def predict_path_endpoint(request: PredictPathRequest) -> dict:
         raise HTTPException(status_code=404, detail=f"Image not found: {image_path}")
 
     try:
-        return predict_image(_to_namespace(request.model_dump()))
+        result = predict_image(_to_namespace(request.model_dump()))
+        return _build_prediction_response(result)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Prediction failed: {exc}") from exc
 
@@ -150,10 +201,48 @@ async def predict_upload_endpoint(
             "image_size": image_size,
             "top_k": top_k,
         }
-        return predict_image(_to_namespace(payload))
+        result = predict_image(_to_namespace(payload))
+        return _build_prediction_response(result)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Prediction failed: {exc}") from exc
     finally:
         if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
+
+
+@app.post("/feedback")
+def feedback_endpoint(request: FeedbackRequest) -> dict:
+    prediction = PREDICTION_CACHE.get(request.prediction_id)
+    if prediction is None:
+        raise HTTPException(status_code=404, detail="prediction_id not found")
+
+    predicted_class = str(prediction["predicted_class"])
+    if request.is_correct:
+        final_class = predicted_class
+    else:
+        if not request.correct_class:
+            raise HTTPException(status_code=422, detail="correct_class is required when is_correct is false")
+        final_class = request.correct_class.strip().lower()
+
+    calories = estimate_calories_for_class(final_class)
+    feedback_entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "prediction_id": request.prediction_id,
+        "checkpoint": prediction.get("checkpoint"),
+        "is_correct": request.is_correct,
+        "predicted_class": predicted_class,
+        "final_class": final_class,
+        "calories": calories,
+    }
+    _append_feedback_log(feedback_entry)
+
+    return {
+        "message": "feedback_saved",
+        "prediction_id": request.prediction_id,
+        "predicted_class": predicted_class,
+        "final_class": final_class,
+        "calories": calories,
+        "feedback_log": str(FEEDBACK_LOG_PATH),
+    }
+
 

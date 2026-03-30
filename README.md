@@ -110,6 +110,26 @@ Predict from uploaded file:
 curl.exe -X POST "http://127.0.0.1:8000/predict/upload" -F "file=@data/raw/cats/img1.jpg" -F "checkpoint=models/best.pt" -F "top_k=3"
 ```
 
+The prediction response now includes:
+
+- `prediction_id` (to send user feedback)
+- `top_prediction` and `predictions`
+- `calories.top1` and `calories.weighted_topk` (estimated calories)
+
+Send user feedback (correct/incorrect) and get adjusted calories:
+
+```powershell
+$feedback = @{
+  prediction_id = "<ID_FROM_PREDICT_UPLOAD_OR_PATH>"
+  is_correct = $false
+  correct_class = "pizza"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:8000/feedback" -ContentType "application/json" -Body $feedback
+```
+
+Feedback is appended to `models/feedback_log.jsonl` for later analysis/retraining.
+
 Train via API:
 
 ```powershell
@@ -141,4 +161,10 @@ Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:8000/evaluate" -ContentTyp
 
 - CPU-only is enforced in code (`torch.device("cpu")`).
 - If pretrained weights cannot be downloaded, code falls back to random initialization.
+- Calories are estimates from a local reference table and default portions (MVP behavior).
 
+# Le modèle doit d'abord être entraîné
+python train.py --raw-dir data/raw --processed-dir data/processed --models-dir models --epochs 5 --batch-size 8
+
+# Ensuite, lancez l'interface
+cd "C:\Users\pierr\OneDrive\Bureau\cours epsi\SN3\MSPR\IA" ; .\.venv\Scripts\streamlit run app.py --logger.level=error
