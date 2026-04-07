@@ -1,18 +1,30 @@
 [
   {
     "type": "correct",
-    "predicted_class": "bibimbap",
-    "confidence": 0.5920588374137878
-  },
-  {
-    "type": "correct",
-    "predicted_class": "beef_carpaccio",
-    "confidence": 0.9895457625389099
+    "predicted_class": "donuts",
+    "confidence": 0.9789392948150635
   },
   {
     "type": "incorrect",
-    "predicted_class": "caprese_salad",
-    "correct_class": "beef_carpaccio",
-    "confidence": 0.25708678364753723
+    "predicted_class": "cannoli",
+    "correct_class": "apple_pie",
+    "confidence": 0.66327303647995
+  },
+  {
+    "type": "incorrect",
+    "predicted_class": "grilled_cheese_sandwich",
+    "correct_class": "apple_pie",
+    "confidence": 0.18795911967754364
+  },
+  {
+    "type": "correct",
+    "predicted_class": "apple_pie",
+    "confidence": 0.34290173649787903
+  },
+  {
+    "type": "incorrect",
+    "predicted_class": "eggs_benedict",
+    "correct_class": "apple_pie",
+    "confidence": 0.28859683871269226
   }
 ]
