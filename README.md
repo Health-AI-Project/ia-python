@@ -232,15 +232,53 @@ python -m pip install -r requirements.txt
 
 ### Si vous voulez lancer l’interface Streamlit
 
-`app.py` utilise Streamlit, mais `streamlit` n’est pas listé dans `requirements.txt`. Installez-le si besoin :
+`app.py` utilise Streamlit, désormais inclus dans `requirements.txt` avec `psycopg[binary]` pour la persistance PostgreSQL :
 
 ```powershell
-python -m pip install streamlit
+python -m pip install -r requirements.txt
 ```
 
 ### Si vous voulez lancer l’API
 
 Le serveur FastAPI repose sur `fastapi`, `uvicorn` et `python-multipart`, déjà présents dans `requirements.txt`.
+
+### Déploiement Docker
+
+Le projet fournit deux images Docker :
+
+- `Dockerfile` : API FastAPI
+- `Dockerfile.streamlit` : interface Streamlit
+
+Un `docker-compose.yml` est aussi fourni pour lancer les deux services.
+
+#### Construire et lancer
+
+```powershell
+docker compose up --build
+```
+
+#### Variables d’environnement PostgreSQL
+
+L’API doit connaître la base PostgreSQL. Vous pouvez utiliser soit `DATABASE_URL`, soit les variables `DB_*`.
+
+```powershell
+$env:DATABASE_URL="postgresql://postgres:<mot_de_passe>@<hote>:5432/postgres"
+```
+
+ou :
+
+```powershell
+$env:DB_USER="postgres"
+$env:DB_PASSWORD="<mot_de_passe>"
+$env:DB_HOST="<hote>"
+$env:DB_PORT="5432"
+$env:DB_NAME="postgres"
+```
+
+#### Ports exposés
+
+- API : `http://localhost:8000`
+- Streamlit : `http://localhost:8501`
 
 ---
 

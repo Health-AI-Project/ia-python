@@ -5,4 +5,6 @@ tqdm
 fastapi
 uvicorn
 python-multipart
+psycopg[binary]
+streamlit
 

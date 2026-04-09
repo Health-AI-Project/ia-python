@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from uuid import uuid4
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from psycopg import connect
 
 from evaluate import evaluate_checkpoint
 from predict import predict_image
@@ -20,7 +22,7 @@ from train import train_model
 app = FastAPI(
     title="Local Image Classifier API",
     version="1.0.0",
-    servers=[{"url": "https://hono.medev-tech.fr", "description": "Production"}],
+    servers=[{"url": "https://python.medev-tech.fr", "description": "Production"}],
     docs_url="/docs",
     openapi_url="/openapi.json",
 )
@@ -70,6 +72,124 @@ class FeedbackRequest(BaseModel):
     correct_class: str | None = None
 
 
+def _build_database_url() -> str:
+    explicit_url = os.getenv("DATABASE_URL")
+    if explicit_url:
+        return explicit_url
+
+    user = os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
+    host = os.getenv("DB_HOST")
+    port = os.getenv("DB_PORT")
+    name = os.getenv("DB_NAME")
+    if all([user, password, host, port, name]):
+        return f"postgresql://{user}:{password}@{host}:{port}/{name}"
+
+    raise RuntimeError(
+        "Database configuration missing. Set DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_PORT/DB_NAME."
+    )
+
+
+def _ensure_database_schema() -> None:
+    query = """
+    CREATE TABLE IF NOT EXISTS api_predictions (
+        id BIGSERIAL PRIMARY KEY,
+        prediction_id TEXT UNIQUE NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        image TEXT,
+        checkpoint TEXT,
+        predicted_class TEXT,
+        predictions_json JSONB NOT NULL,
+        calories_json JSONB NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS api_feedback (
+        id BIGSERIAL PRIMARY KEY,
+        timestamp TIMESTAMPTZ NOT NULL,
+        prediction_id TEXT NOT NULL,
+        checkpoint TEXT,
+        is_correct BOOLEAN NOT NULL,
+        predicted_class TEXT NOT NULL,
+        final_class TEXT NOT NULL,
+        calories_json JSONB NOT NULL
+    );
+    """
+    database_url = _build_database_url()
+    with connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+        conn.commit()
+
+
+def _save_prediction_to_db(enriched: dict) -> None:
+    database_url = _build_database_url()
+    query = """
+    INSERT INTO api_predictions (
+        prediction_id,
+        created_at,
+        image,
+        checkpoint,
+        predicted_class,
+        predictions_json,
+        calories_json
+    )
+    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+    ON CONFLICT (prediction_id) DO UPDATE SET
+        created_at = EXCLUDED.created_at,
+        image = EXCLUDED.image,
+        checkpoint = EXCLUDED.checkpoint,
+        predicted_class = EXCLUDED.predicted_class,
+        predictions_json = EXCLUDED.predictions_json,
+        calories_json = EXCLUDED.calories_json;
+    """
+    with connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                query,
+                (
+                    enriched["prediction_id"],
+                    enriched["created_at"],
+                    enriched.get("image"),
+                    enriched.get("checkpoint"),
+                    enriched["top_prediction"]["class_name"],
+                    json.dumps(enriched.get("predictions", []), ensure_ascii=True),
+                    json.dumps(enriched.get("calories", {}), ensure_ascii=True),
+                ),
+            )
+        conn.commit()
+
+
+def _save_feedback_to_db(entry: dict) -> None:
+    database_url = _build_database_url()
+    query = """
+    INSERT INTO api_feedback (
+        timestamp,
+        prediction_id,
+        checkpoint,
+        is_correct,
+        predicted_class,
+        final_class,
+        calories_json
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb);
+    """
+    with connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                query,
+                (
+                    entry["timestamp"],
+                    entry["prediction_id"],
+                    entry.get("checkpoint"),
+                    entry["is_correct"],
+                    entry["predicted_class"],
+                    entry["final_class"],
+                    json.dumps(entry["calories"], ensure_ascii=True),
+                ),
+            )
+        conn.commit()
+
+
 def _append_feedback_log(entry: dict) -> None:
     FEEDBACK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with FEEDBACK_LOG_PATH.open("a", encoding="utf-8") as file:
@@ -105,6 +225,10 @@ def _build_prediction_response(result: dict) -> dict:
         "predicted_class": best_prediction["class_name"],
         "predictions": predictions,
     }
+    try:
+        _save_prediction_to_db(enriched)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Prediction persistence failed: {exc}") from exc
     return enriched
 
 
@@ -116,6 +240,14 @@ def _to_namespace(payload: dict) -> argparse.Namespace:
         else:
             converted[key] = value
     return argparse.Namespace(**converted)
+
+
+@app.on_event("startup")
+def startup() -> None:
+    try:
+        _ensure_database_schema()
+    except Exception as exc:
+        raise RuntimeError(f"Database initialization failed: {exc}") from exc
 
 
 @app.get("/health")
@@ -240,6 +372,11 @@ def feedback_endpoint(request: FeedbackRequest) -> dict:
         "final_class": final_class,
         "calories": calories,
     }
+    try:
+        _save_feedback_to_db(feedback_entry)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Feedback persistence failed: {exc}") from exc
+
     _append_feedback_log(feedback_entry)
 
     return {
