@@ -30,6 +30,14 @@ PREDICTION_CACHE: dict[str, dict] = {}
 FEEDBACK_LOG_PATH = Path("models/feedback_log.jsonl")
 DB_READY = False
 DB_STATUS_MESSAGE = "database_not_initialized"
+DEFAULT_DB_USER = "postgres"
+DEFAULT_DB_PASSWORD = "uqCt0OqIlbjUcUhYPbZ3"
+DEFAULT_DB_HOST = "137.74.113.34"
+DEFAULT_DB_PORT = "5432"
+DEFAULT_DB_NAME = "postgres"
+DEFAULT_DATABASE_URL = (
+    f"postgresql://{DEFAULT_DB_USER}:{DEFAULT_DB_PASSWORD}@{DEFAULT_DB_HOST}:{DEFAULT_DB_PORT}/{DEFAULT_DB_NAME}"
+)
 
 
 class TrainRequest(BaseModel):
@@ -79,17 +87,15 @@ def _build_database_url() -> str:
     if explicit_url:
         return explicit_url
 
-    user = os.getenv("DB_USER")
-    password = os.getenv("DB_PASSWORD")
-    host = os.getenv("DB_HOST")
-    port = os.getenv("DB_PORT")
-    name = os.getenv("DB_NAME")
+    user = os.getenv("DB_USER", DEFAULT_DB_USER)
+    password = os.getenv("DB_PASSWORD", DEFAULT_DB_PASSWORD)
+    host = os.getenv("DB_HOST", DEFAULT_DB_HOST)
+    port = os.getenv("DB_PORT", DEFAULT_DB_PORT)
+    name = os.getenv("DB_NAME", DEFAULT_DB_NAME)
     if all([user, password, host, port, name]):
         return f"postgresql://{user}:{password}@{host}:{port}/{name}"
 
-    raise RuntimeError(
-        "Database configuration missing. Set DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_PORT/DB_NAME."
-    )
+    return DEFAULT_DATABASE_URL
 
 
 def _ensure_database_schema() -> None:
