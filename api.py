@@ -28,6 +28,8 @@ app = FastAPI(
 )
 PREDICTION_CACHE: dict[str, dict] = {}
 FEEDBACK_LOG_PATH = Path("models/feedback_log.jsonl")
+DB_READY = False
+DB_STATUS_MESSAGE = "database_not_initialized"
 
 
 class TrainRequest(BaseModel):
@@ -121,7 +123,24 @@ def _ensure_database_schema() -> None:
         conn.commit()
 
 
-def _save_prediction_to_db(enriched: dict) -> None:
+def _try_initialize_database() -> bool:
+    global DB_READY, DB_STATUS_MESSAGE
+    try:
+        _ensure_database_schema()
+        DB_READY = True
+        DB_STATUS_MESSAGE = "ok"
+        return True
+    except Exception as exc:
+        DB_READY = False
+        DB_STATUS_MESSAGE = str(exc)
+        return False
+
+
+def _save_prediction_to_db(enriched: dict) -> bool:
+    global DB_READY, DB_STATUS_MESSAGE
+    if not DB_READY and not _try_initialize_database():
+        return False
+
     database_url = _build_database_url()
     query = """
     INSERT INTO api_predictions (
@@ -142,24 +161,34 @@ def _save_prediction_to_db(enriched: dict) -> None:
         predictions_json = EXCLUDED.predictions_json,
         calories_json = EXCLUDED.calories_json;
     """
-    with connect(database_url) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                query,
-                (
-                    enriched["prediction_id"],
-                    enriched["created_at"],
-                    enriched.get("image"),
-                    enriched.get("checkpoint"),
-                    enriched["top_prediction"]["class_name"],
-                    json.dumps(enriched.get("predictions", []), ensure_ascii=True),
-                    json.dumps(enriched.get("calories", {}), ensure_ascii=True),
-                ),
-            )
-        conn.commit()
+    try:
+        with connect(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    query,
+                    (
+                        enriched["prediction_id"],
+                        enriched["created_at"],
+                        enriched.get("image"),
+                        enriched.get("checkpoint"),
+                        enriched["top_prediction"]["class_name"],
+                        json.dumps(enriched.get("predictions", []), ensure_ascii=True),
+                        json.dumps(enriched.get("calories", {}), ensure_ascii=True),
+                    ),
+                )
+            conn.commit()
+        return True
+    except Exception as exc:
+        DB_READY = False
+        DB_STATUS_MESSAGE = str(exc)
+        return False
 
 
-def _save_feedback_to_db(entry: dict) -> None:
+def _save_feedback_to_db(entry: dict) -> bool:
+    global DB_READY, DB_STATUS_MESSAGE
+    if not DB_READY and not _try_initialize_database():
+        return False
+
     database_url = _build_database_url()
     query = """
     INSERT INTO api_feedback (
@@ -173,21 +202,27 @@ def _save_feedback_to_db(entry: dict) -> None:
     )
     VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb);
     """
-    with connect(database_url) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                query,
-                (
-                    entry["timestamp"],
-                    entry["prediction_id"],
-                    entry.get("checkpoint"),
-                    entry["is_correct"],
-                    entry["predicted_class"],
-                    entry["final_class"],
-                    json.dumps(entry["calories"], ensure_ascii=True),
-                ),
-            )
-        conn.commit()
+    try:
+        with connect(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    query,
+                    (
+                        entry["timestamp"],
+                        entry["prediction_id"],
+                        entry.get("checkpoint"),
+                        entry["is_correct"],
+                        entry["predicted_class"],
+                        entry["final_class"],
+                        json.dumps(entry["calories"], ensure_ascii=True),
+                    ),
+                )
+            conn.commit()
+        return True
+    except Exception as exc:
+        DB_READY = False
+        DB_STATUS_MESSAGE = str(exc)
+        return False
 
 
 def _append_feedback_log(entry: dict) -> None:
@@ -225,10 +260,7 @@ def _build_prediction_response(result: dict) -> dict:
         "predicted_class": best_prediction["class_name"],
         "predictions": predictions,
     }
-    try:
-        _save_prediction_to_db(enriched)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Prediction persistence failed: {exc}") from exc
+    enriched["database_saved"] = _save_prediction_to_db(enriched)
     return enriched
 
 
@@ -244,15 +276,19 @@ def _to_namespace(payload: dict) -> argparse.Namespace:
 
 @app.on_event("startup")
 def startup() -> None:
-    try:
-        _ensure_database_schema()
-    except Exception as exc:
-        raise RuntimeError(f"Database initialization failed: {exc}") from exc
+    _try_initialize_database()
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "device": str(torch.device("cpu"))}
+    return {
+        "status": "ok",
+        "device": str(torch.device("cpu")),
+        "database": {
+            "ready": DB_READY,
+            "message": DB_STATUS_MESSAGE,
+        },
+    }
 
 
 @app.get("/model/status")
@@ -372,10 +408,7 @@ def feedback_endpoint(request: FeedbackRequest) -> dict:
         "final_class": final_class,
         "calories": calories,
     }
-    try:
-        _save_feedback_to_db(feedback_entry)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Feedback persistence failed: {exc}") from exc
+    database_saved = _save_feedback_to_db(feedback_entry)
 
     _append_feedback_log(feedback_entry)
 
@@ -385,6 +418,7 @@ def feedback_endpoint(request: FeedbackRequest) -> dict:
         "predicted_class": predicted_class,
         "final_class": final_class,
         "calories": calories,
+        "database_saved": database_saved,
         "feedback_log": str(FEEDBACK_LOG_PATH),
     }
 

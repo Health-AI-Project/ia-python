@@ -232,10 +232,10 @@ python -m pip install -r requirements.txt
 
 ### Si vous voulez lancer l’interface Streamlit
 
-`app.py` utilise Streamlit, désormais inclus dans `requirements.txt` avec `psycopg[binary]` pour la persistance PostgreSQL :
+`app.py` utilise Streamlit, installé via `requirements.streamlit.txt` :
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.streamlit.txt
 ```
 
 ### Si vous voulez lancer l’API
@@ -249,12 +249,24 @@ Le projet fournit deux images Docker :
 - `Dockerfile` : API FastAPI
 - `Dockerfile.streamlit` : interface Streamlit
 
+Les dépendances sont séparées pour accélérer les builds :
+
+- `requirements.api.txt` : dépendances API (sans Streamlit)
+- `requirements.streamlit.txt` : dépendances UI (inclut API + Streamlit)
+
 Un `docker-compose.yml` est aussi fourni pour lancer les deux services.
 
 #### Construire et lancer
 
 ```powershell
 docker compose up --build
+```
+
+Si vous déployez seulement l’API (ex: Dokploy avec `Dockerfile`) :
+
+```powershell
+docker build -f Dockerfile -t ia-api .
+docker run --rm -p 8000:8000 --env DATABASE_URL="postgresql://postgres:<mot_de_passe>@<hote>:5432/postgres" ia-api
 ```
 
 #### Variables d’environnement PostgreSQL
