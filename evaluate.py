@@ -5,10 +5,11 @@ from pathlib import Path
 
 import torch
 from torch import nn
+from sklearn.metrics import classification_report
 
 from src.config import EvalConfig
 from src.data import build_dataloaders
-from src.engine import load_checkpoint, run_epoch
+from src.engine import load_checkpoint
 from src.model import create_model
 
 
@@ -43,8 +44,59 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict:
     model.to(device)
 
     criterion = nn.CrossEntropyLoss()
-    test_loss, test_acc = run_epoch(model, test_loader, criterion, device, optimizer=None)
-    results = {"test_loss": test_loss, "test_acc": test_acc, "classes": class_names}
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_count = 0
+    all_targets = []
+    all_predictions = []
+
+    with torch.no_grad():
+        for images, targets in test_loader:
+            images = images.to(device)
+            targets = targets.to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+            preds = outputs.argmax(dim=1)
+
+            total_loss += loss.item() * targets.size(0)
+            total_correct += (preds == targets).sum().item()
+            total_count += targets.size(0)
+
+            all_targets.extend(targets.cpu().tolist())
+            all_predictions.extend(preds.cpu().tolist())
+
+    test_loss = total_loss / max(total_count, 1)
+    test_acc = total_correct / max(total_count, 1)
+
+    if total_count > 0:
+        classification_report_text = classification_report(
+            all_targets,
+            all_predictions,
+            labels=list(range(len(class_names))),
+            target_names=class_names,
+            zero_division=0,
+        )
+        classification_report_dict = classification_report(
+            all_targets,
+            all_predictions,
+            labels=list(range(len(class_names))),
+            target_names=class_names,
+            output_dict=True,
+            zero_division=0,
+        )
+    else:
+        classification_report_text = "No test samples available."
+        classification_report_dict = {}
+
+    results = {
+        "test_loss": test_loss,
+        "test_acc": test_acc,
+        "classes": class_names,
+        "classification_report": classification_report_text,
+        "classification_report_dict": classification_report_dict,
+    }
     return results
 
 
@@ -52,7 +104,8 @@ def main() -> None:
     args = parse_args()
     results = evaluate_checkpoint(args)
 
-    print(results)
+    print({"test_loss": results["test_loss"], "test_acc": results["test_acc"], "classes": results["classes"]})
+    print(results["classification_report"])
 
 
 if __name__ == "__main__":

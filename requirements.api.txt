@@ -7,4 +7,5 @@ fastapi
 uvicorn
 python-multipart
 psycopg[binary]
+scikit-learn
 

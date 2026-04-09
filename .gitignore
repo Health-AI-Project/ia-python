@@ -3,8 +3,5 @@ __pycache__/
 .idea/
 .vscode/
 data/
-models/
-*.pt
-history.json
 *.log
 
