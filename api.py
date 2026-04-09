@@ -17,7 +17,13 @@ from src.engine import load_checkpoint
 from src.nutrition import estimate_calories_for_class, estimate_weighted_calories
 from train import train_model
 
-app = FastAPI(title="Local Image Classifier API", version="1.0.0")
+app = FastAPI(
+    title="Local Image Classifier API",
+    version="1.0.0",
+    servers=[{"url": "https://hono.medev-tech.fr", "description": "Production"}],
+    docs_url="/docs",
+    openapi_url="/openapi.json",
+)
 PREDICTION_CACHE: dict[str, dict] = {}
 FEEDBACK_LOG_PATH = Path("models/feedback_log.jsonl")
 

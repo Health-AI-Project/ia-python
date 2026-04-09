@@ -918,6 +918,8 @@ python predict.py --checkpoint models/best.pt --image data/raw/pizza/img1.jpg --
 # Tester le pipeline rapidement
 python quick_check.py
 
+cd "C:\Users\pierr\OneDrive\Bureau\cours epsi\SN3\MSPR\IA" ; .\.venv\Scripts\Activate.ps1 ; pip install python-multipart
+
 # Démarrer l’API
 uvicorn api:app --host 127.0.0.1 --port 8000
 
