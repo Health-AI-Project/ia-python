@@ -175,12 +175,16 @@ La fonction `auto_split_dataset()` :
 
 `build_dataloaders()` utilise `torchvision.datasets.ImageFolder` :
 
-- `train` applique des augmentations légères :
-  - redimensionnement
+- `train` applique des augmentations réalistes et CPU-friendly :
+  - `RandomResizedCrop`
   - flip horizontal aléatoire
+  - rotation légère
   - `ColorJitter`
-  - normalisation ImageNet
-- `val` et `test` utilisent un pipeline plus simple, sans augmentation, pour des mesures propres.
+  - `RandomAutocontrast`
+  - `RandomErasing` optionnel
+- `val` et `test` utilisent un pipeline déterministe avec normalisation ImageNet.
+- les images corrompues sont filtrées avant le split et avant le chargement.
+- des poids de classes peuvent être calculés pour mieux gérer un dataset déséquilibré.
 
 ### 4. Création du modèle
 
@@ -190,10 +194,19 @@ La fonction `auto_split_dataset()` :
 - `mobilenet_v3_small`
 
 Les couches du backbone sont gelées au départ, puis la tête de classification est remplacée pour correspondre au nombre de classes du dataset.
+Le head inclut maintenant un `Dropout` configurable, et le nombre de blocs dégelés pour le fine-tuning est paramétrable.
 
 ### 5. Entraînement et fine-tuning
 
 `train.py` entraîne d’abord la tête de classification. Ensuite, à partir de l’époque définie par `--unfreeze-epoch`, une partie plus profonde du backbone est dégelée pour du fine-tuning.
+
+Le pipeline ajoute aussi :
+
+- `Early Stopping` sur la validation loss ;
+- scheduler `ReduceLROnPlateau` ;
+- `AdamW` avec weight decay ;
+- `CrossEntropyLoss` pondérée par classe ;
+- historique JSON enrichi avec `loss`, `accuracy`, `lr` et état du fine-tuning.
 
 ### 6. Sauvegarde
 
@@ -321,6 +334,38 @@ Ce test est utile pour vérifier rapidement que PyTorch, torchvision, PIL et le 
 
 ---
 
+## Tests PyTest
+
+Le projet inclut une suite PyTest ciblée sur les zones critiques (split de données, prédiction, nutrition, helpers API, endpoints FastAPI).
+
+Guide detaille (avec exemples reels de code): `docs/testing.md`
+
+### Lancer tous les tests
+
+```powershell
+python -m pytest
+```
+
+### Lancer uniquement les tests unitaires
+
+```powershell
+python -m pytest tests/unit
+```
+
+### Lancer avec rapport de couverture
+
+```powershell
+python -m pytest --cov=src --cov=api --cov=predict --cov-report=term-missing
+```
+
+### CI locale rapide
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\ci_local.ps1
+```
+
+---
+
 <a id="entrainement"></a>
 ## Entraînement
 
@@ -387,10 +432,11 @@ python train.py --skip-split --processed-dir data/processed --models-dir models
 ### Détails techniques de l’entraînement
 
 - Tout s’exécute sur `torch.device("cpu")`.
-- Le critère utilisé est `CrossEntropyLoss`.
-- L’optimiseur est `Adam`.
+- Le critère utilisé est `CrossEntropyLoss` avec poids de classes et, si souhaité, label smoothing.
+- L’optimiseur est `AdamW` pour un réglage plus propre du weight decay.
 - Les paramètres entraînables au départ sont ceux de la tête ajoutée sur le backbone.
 - Au moment du fine-tuning, `resnet18` dégage `layer4` et la couche finale, tandis que `mobilenet_v3_small` dégage les derniers blocs convolutifs et le classifieur.
+- Les options `--dropout`, `--fine-tune-layers`, `--early-stopping-patience`, `--scheduler-patience` et `--augmentation-strength` rendent le comportement plus robuste sans alourdir l’usage de base.
 
 ### Historique de l’entraînement
 
@@ -425,10 +471,11 @@ python evaluate.py --processed-dir data/processed --checkpoint models/best.pt
 - reconstruit le modèle avec le bon backbone et le bon nombre de classes ;
 - lit le split `test` ;
 - calcule la loss et l’accuracy ;
-- affiche un dictionnaire Python contenant :
-  - `test_loss`
-  - `test_acc`
-  - `classes`
+- calcule aussi :
+  - la matrice de confusion ;
+  - le rapport précision / recall / F1 par classe ;
+  - les classes les plus confondues ;
+  - un export JSON et texte dans `models/evaluation/`.
 
 ### Exemple de sortie
 
@@ -462,7 +509,8 @@ python predict.py --checkpoint models/best.pt --image data/raw/pizza/img1.jpg --
 - charge l’image ;
 - applique la transformation standard ;
 - calcule les probabilités ;
-- affiche le top-k.
+- renvoie un top-k enrichi avec rang, pourcentage et seuil de confiance ;
+- marque la prédiction comme `uncertain` si le score max est sous le seuil demandé.
 
 ### Format de sortie
 
@@ -470,9 +518,21 @@ La fonction renvoie un dictionnaire avec :
 
 - `image` : chemin de l’image
 - `checkpoint` : chemin du modèle
-- `predictions` : liste ordonnée de prédictions
+- `predictions` : liste ordonnée de prédictions enrichies
+- `top_prediction` : meilleure classe
+- `confidence_threshold` : seuil utilisé
+- `uncertain` : booléen indiquant un cas ambigu
 
-Chaque prédiction a la forme `{"class_name": "pizza", "score": 0.83}`.
+Chaque prédiction a la forme `{"rank": 1, "class_name": "pizza", "score": 0.83, "confidence_pct": 83.0, "is_top": true}`.
+
+### Pourquoi ces choix améliorent le modèle
+
+- les augmentations réalistes rendent le modèle plus robuste aux variations d’angle, de lumière et de cadrage ;
+- la normalisation ImageNet aligne les entrées avec les backbones pré-entraînés ;
+- la loss pondérée aide en cas de classes déséquilibrées ;
+- l’early stopping et le scheduler limitent l’overfitting et stabilisent l’apprentissage ;
+- la confusion matrix et les scores F1 aident à expliquer les erreurs au jury ;
+- le seuil de confiance rend la prédiction plus sûre en signalant les cas ambigus au lieu de sur-affirmer.
 
 ### Exemple d’utilisation depuis Python
 

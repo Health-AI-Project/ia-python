@@ -4,14 +4,19 @@ Interface Streamlit interactive pour tester et corriger le modèle de classifica
 
 import json
 from pathlib import Path
+from typing import Any
 
-import streamlit as st
+try:
+    import streamlit as st
+except ImportError:
+    st: Any = None
+
 import torch
 from PIL import Image
 from torchvision import transforms
 
 from src.engine import load_checkpoint
-from src.model import create_model, topk_predictions
+from src.model import create_model, load_model_state
 
 
 def make_transform(image_size: int):
@@ -23,7 +28,6 @@ def make_transform(image_size: int):
     ])
 
 
-@st.cache_resource
 def load_model(checkpoint_path: Path, image_size: int = 224):
     """Charge le modèle entraîné et le checkpoint."""
     device = torch.device("cpu")
@@ -35,7 +39,7 @@ def load_model(checkpoint_path: Path, image_size: int = 224):
         num_classes=len(class_names),
         pretrained=False
     )
-    model.load_state_dict(checkpoint["model_state"])
+    load_model_state(model, checkpoint["model_state"])
     model.to(device)
     model.eval()
 
@@ -65,6 +69,9 @@ def get_probabilities(logits, class_names, top_k=5):
 
 
 def main():
+    if st is None:
+        raise RuntimeError("Streamlit n'est pas installé. Installez `requirements.streamlit.txt` pour lancer cette interface.")
+
     st.set_page_config(page_title="🍕 Food Classifier", layout="wide")
     st.title("🍕 Testeur d'IA - Classification d'Images de Nourriture")
 
@@ -174,22 +181,26 @@ def main():
         st.subheader("🎯 Résultats")
 
         if st.session_state.prediction_result is not None:
-            predictions = st.session_state.prediction_result["predictions"]
+            predictions: list[dict[str, Any]] = st.session_state.prediction_result["predictions"]
 
             # Afficher le meilleur résultat en gros
             best_pred = predictions[0]
+            best_class_name = str(best_pred["class_name"])
+            best_confidence = str(best_pred["confidence"])
             st.metric(
                 label="🏆 Meilleure prédiction",
-                value=best_pred["class_name"].replace("_", " ").title(),
-                delta=best_pred["confidence"]
+                value=best_class_name.replace("_", " ").title(),
+                delta=best_confidence
             )
 
             # Afficher tous les résultats
             st.write("**Top prédictions:**")
             for i, pred in enumerate(predictions, 1):
-                confidence = pred["score"] * 100
+                class_name = str(pred["class_name"])
+                score = float(pred["score"])
+                confidence = score * 100
                 bar_color = "🟢" if i == 1 else "🟡" if i <= 3 else "🔴"
-                st.write(f"{bar_color} **{i}. {pred['class_name'].replace('_', ' ').title()}**: {confidence:.1f}%")
+                st.write(f"{bar_color} **{i}. {class_name.replace('_', ' ').title()}**: {confidence:.1f}%")
 
             # Section Feedback
             st.divider()

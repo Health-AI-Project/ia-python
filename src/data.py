@@ -4,23 +4,36 @@ import random
 import shutil
 import stat
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 from PIL import Image, ImageOps
+import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from torchvision.transforms import InterpolationMode
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 SPLITS = ("train", "val", "test")
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 def _is_image(path: Path) -> bool:
     return path.suffix.lower() in IMAGE_EXTENSIONS
 
 
-def find_class_images(raw_dir: Path) -> Dict[str, List[Path]]:
+def _is_readable_image(path: Path) -> bool:
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except Exception:
+        return False
+
+
+def find_class_images(raw_dir: Path, verify_images: bool = True) -> Dict[str, List[Path]]:
     class_images: Dict[str, List[Path]] = defaultdict(list)
     if not raw_dir.exists():
         return {}
@@ -30,6 +43,8 @@ def find_class_images(raw_dir: Path) -> Dict[str, List[Path]]:
             continue
         for file_path in class_dir.rglob("*"):
             if file_path.is_file() and _is_image(file_path):
+                if verify_images and not _is_readable_image(file_path):
+                    continue
                 class_images[class_dir.name].append(file_path)
 
     # Keep deterministic order for reproducibility.
@@ -122,7 +137,7 @@ def auto_split_dataset(
     if abs((train_ratio + val_ratio + test_ratio) - 1.0) > 1e-6:
         raise ValueError("train_ratio + val_ratio + test_ratio must equal 1.0")
 
-    class_images = find_class_images(raw_dir)
+    class_images = find_class_images(raw_dir, verify_images=True)
     if not class_images:
         raise ValueError(f"No images found in {raw_dir}")
 
@@ -157,30 +172,117 @@ def auto_split_dataset(
     return stats
 
 
-def get_transforms(image_size: int):
-    train_transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
+def build_transforms(image_size: int, augmentations: bool = True, augmentation_strength: float = 0.2):
+    resize_size = max(image_size, int(image_size * 1.15))
+    jitter = max(0.0, float(augmentation_strength))
+
+    if augmentations:
+        train_transforms = [
+            transforms.RandomResizedCrop(
+                image_size,
+                scale=(0.75, 1.0),
+                ratio=(0.9, 1.1),
+                interpolation=InterpolationMode.BILINEAR,
+            ),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomRotation(degrees=12),
+            transforms.ColorJitter(
+                brightness=0.2 * jitter,
+                contrast=0.2 * jitter,
+                saturation=0.2 * jitter,
+                hue=0.05 * jitter,
+            ),
+            transforms.RandomAutocontrast(p=0.15),
+            transforms.RandomAffine(degrees=0, translate=(0.05 * jitter, 0.05 * jitter), scale=(0.9, 1.1)),
         ]
+    else:
+        train_transforms = [
+            transforms.Resize(resize_size, interpolation=InterpolationMode.BILINEAR),
+            transforms.CenterCrop(image_size),
+        ]
+
+    train_transforms.extend(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
+    if augmentations:
+        train_transforms.append(
+            transforms.RandomErasing(p=0.1, scale=(0.02, 0.08), value="random")
+        )
+
+    train_transform = transforms.Compose(
+        train_transforms
     )
 
     eval_transform = transforms.Compose(
         [
-            transforms.Resize((image_size, image_size)),
+            transforms.Resize(resize_size, interpolation=InterpolationMode.BILINEAR),
+            transforms.CenterCrop(image_size),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
     )
 
     return train_transform, eval_transform
 
 
-def build_dataloaders(processed_dir: Path, image_size: int, batch_size: int, num_workers: int = 0):
-    train_transform, eval_transform = get_transforms(image_size)
+def _validate_processed_split(split_dir: Path) -> list[Path]:
+    invalid_files: list[Path] = []
+    if not split_dir.exists():
+        return invalid_files
+
+    for file_path in split_dir.rglob("*"):
+        if file_path.is_file() and _is_image(file_path) and not _is_readable_image(file_path):
+            invalid_files.append(file_path)
+    return invalid_files
+
+
+def compute_class_weights(dataset) -> torch.Tensor:
+    targets: Sequence[int] = getattr(dataset, "targets", [])
+    class_names: Sequence[str] = getattr(dataset, "classes", [])
+    if not class_names:
+        raise ValueError("Dataset must expose class names to compute class weights")
+
+    counts = Counter(targets)
+    total = max(len(targets), 1)
+    num_classes = len(class_names)
+    weights = []
+    for class_index in range(num_classes):
+        class_count = counts.get(class_index, 0)
+        if class_count == 0:
+            weights.append(0.0)
+        else:
+            weights.append(total / (num_classes * class_count))
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def build_dataloaders(
+    processed_dir: Path,
+    image_size: int,
+    batch_size: int,
+    num_workers: int = 0,
+    augmentations: bool = True,
+    augmentation_strength: float = 0.2,
+):
+    invalid_files: list[Path] = []
+    for split in SPLITS:
+        invalid_files.extend(_validate_processed_split(processed_dir / split))
+
+    if invalid_files:
+        sample = "\n".join(f"- {path}" for path in invalid_files[:10])
+        raise ValueError(
+            "Invalid or corrupted images were found in the processed dataset. "
+            f"Remove or regenerate them before training. Examples:\n{sample}"
+        )
+
+    train_transform, eval_transform = build_transforms(
+        image_size=image_size,
+        augmentations=augmentations,
+        augmentation_strength=augmentation_strength,
+    )
 
     train_dataset = datasets.ImageFolder(processed_dir / "train", transform=train_transform)
     val_dataset = datasets.ImageFolder(processed_dir / "val", transform=eval_transform)

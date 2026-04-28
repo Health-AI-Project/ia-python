@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
 from torch import nn
 
 from src.config import TrainConfig
-from src.data import auto_split_dataset, build_dataloaders, create_synthetic_dataset, find_class_images
+from src.data import auto_split_dataset, build_dataloaders, compute_class_weights, create_synthetic_dataset, find_class_images
 from src.engine import run_epoch, save_checkpoint
 from src.model import create_model, get_trainable_parameters, unfreeze_for_finetune
 
@@ -24,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--fine-tune-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--test-ratio", type=float, default=0.1)
@@ -31,7 +33,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--backbone", type=str, default="resnet18", choices=["resnet18", "mobilenet_v3_small"])
     parser.add_argument("--no-pretrained", action="store_true", help="Disable pretrained ImageNet weights")
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--unfreeze-epoch", type=int, default=1, help="Epoch to unfreeze part of backbone for fine-tuning")
+    parser.add_argument("--fine-tune-layers", type=int, default=1, help="How many backbone blocks to unfreeze for fine-tuning")
+    parser.add_argument("--no-augmentations", action="store_true", help="Disable train-time data augmentations")
+    parser.add_argument("--augmentation-strength", type=float, default=0.2)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-3)
+    parser.add_argument("--scheduler-factor", type=float, default=0.5)
+    parser.add_argument("--scheduler-patience", type=int, default=1)
     parser.add_argument("--skip-split", action="store_true", help="Use existing processed split folders")
     parser.add_argument(
         "--run-forever",
@@ -71,6 +82,7 @@ def train_model(args: argparse.Namespace) -> dict:
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         fine_tune_learning_rate=args.fine_tune_learning_rate,
+        weight_decay=args.weight_decay,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
@@ -78,7 +90,16 @@ def train_model(args: argparse.Namespace) -> dict:
         num_workers=args.num_workers,
         backbone=args.backbone,
         pretrained=not args.no_pretrained,
+        dropout=args.dropout,
         unfreeze_epoch=args.unfreeze_epoch,
+        fine_tune_layers=args.fine_tune_layers,
+        augmentations=not args.no_augmentations,
+        augmentation_strength=args.augmentation_strength,
+        label_smoothing=args.label_smoothing,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        scheduler_factor=args.scheduler_factor,
+        scheduler_patience=args.scheduler_patience,
     )
 
     set_seed(cfg.seed)
@@ -111,22 +132,38 @@ def train_model(args: argparse.Namespace) -> dict:
         print("Split done:", json.dumps(split_stats, indent=2))
 
     train_loader, val_loader, _, class_names = build_dataloaders(
-        cfg.processed_dir, cfg.image_size, cfg.batch_size, cfg.num_workers
+        cfg.processed_dir,
+        cfg.image_size,
+        cfg.batch_size,
+        cfg.num_workers,
+        augmentations=cfg.augmentations,
+        augmentation_strength=cfg.augmentation_strength,
     )
 
     print(f"Classes: {class_names}")
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
-    model = create_model(cfg.backbone, num_classes=len(class_names), pretrained=cfg.pretrained)
+    model = create_model(cfg.backbone, num_classes=len(class_names), pretrained=cfg.pretrained, dropout=cfg.dropout)
     model.to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(get_trainable_parameters(model), lr=cfg.learning_rate)
+    class_weights = compute_class_weights(train_loader.dataset).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=max(0.0, float(cfg.label_smoothing)))
+    optimizer = torch.optim.AdamW(get_trainable_parameters(model), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=cfg.scheduler_factor,
+        patience=cfg.scheduler_patience,
+    )
 
     best_val_acc = -1.0
+    best_val_loss = float("inf")
+    best_epoch = 0
+    no_improve_epochs = 0
     history = []
     run_forever = getattr(args, "run_forever", False)
     epoch_index = 0
+    fine_tuning_enabled = False
 
     if run_forever:
         print("Infinite training mode enabled. Press Ctrl+C to stop.")
@@ -136,12 +173,25 @@ def train_model(args: argparse.Namespace) -> dict:
             if (not run_forever) and (epoch_index >= cfg.epochs):
                 break
 
-            if epoch_index == cfg.unfreeze_epoch:
-                unfreeze_for_finetune(model, cfg.backbone)
-                optimizer = torch.optim.Adam(get_trainable_parameters(model), lr=cfg.fine_tune_learning_rate)
+            if (not fine_tuning_enabled) and epoch_index >= cfg.unfreeze_epoch:
+                unfreeze_for_finetune(model, cfg.backbone, trainable_layers=cfg.fine_tune_layers)
+                optimizer = torch.optim.AdamW(
+                    get_trainable_parameters(model),
+                    lr=cfg.fine_tune_learning_rate,
+                    weight_decay=cfg.weight_decay,
+                )
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode="min",
+                    factor=cfg.scheduler_factor,
+                    patience=cfg.scheduler_patience,
+                )
+                fine_tuning_enabled = True
+                print(f"Fine-tuning enabled: last {cfg.fine_tune_layers} layer(s) unfrozen.")
 
             train_loss, train_acc = run_epoch(model, train_loader, criterion, device, optimizer=optimizer)
             val_loss, val_acc = run_epoch(model, val_loader, criterion, device, optimizer=None)
+            scheduler.step(val_loss)
 
             epoch_metrics = {
                 "epoch": epoch_index + 1,
@@ -149,6 +199,8 @@ def train_model(args: argparse.Namespace) -> dict:
                 "train_acc": train_acc,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
+                "lr": optimizer.param_groups[0]["lr"],
+                "fine_tuning": fine_tuning_enabled,
             }
             history.append(epoch_metrics)
             print(epoch_metrics)
@@ -160,13 +212,29 @@ def train_model(args: argparse.Namespace) -> dict:
                 "image_size": cfg.image_size,
                 "epoch": epoch_index + 1,
                 "metrics": epoch_metrics,
+                "config": asdict(cfg),
+                "class_weights": class_weights.cpu().tolist(),
             }
 
-            save_checkpoint(cfg.models_dir / "last.pt", checkpoint_payload)
-
-            if val_acc > best_val_acc:
+            improved = val_loss < (best_val_loss - cfg.early_stopping_min_delta)
+            if improved or (val_loss == best_val_loss and val_acc > best_val_acc):
+                best_val_loss = val_loss
                 best_val_acc = val_acc
-                save_checkpoint(cfg.models_dir / "best.pt", checkpoint_payload)
+                best_epoch = epoch_index + 1
+                no_improve_epochs = 0
+                best_payload = {**checkpoint_payload, "best_val_loss": best_val_loss, "best_val_acc": best_val_acc}
+                save_checkpoint(cfg.models_dir / "best.pt", best_payload)
+            else:
+                no_improve_epochs += 1
+
+            current_payload = {**checkpoint_payload, "best_val_loss": best_val_loss, "best_val_acc": best_val_acc}
+            save_checkpoint(cfg.models_dir / "last.pt", current_payload)
+
+            if (not run_forever) and cfg.early_stopping_patience > 0 and no_improve_epochs >= cfg.early_stopping_patience:
+                print(
+                    f"Early stopping triggered after {cfg.early_stopping_patience} epoch(s) without improvement."
+                )
+                break
 
             epoch_index += 1
     except KeyboardInterrupt:
@@ -175,19 +243,31 @@ def train_model(args: argparse.Namespace) -> dict:
     with (cfg.models_dir / "history.json").open("w", encoding="utf-8") as fp:
         json.dump(history, fp, indent=2)
 
-    completed_epochs = len(history)
-    print(f"Training done. Completed epochs={completed_epochs} | Best val_acc={best_val_acc:.4f}")
-    return {
+    summary = {
         "best_val_acc": best_val_acc,
-        "epochs": cfg.epochs,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "epochs_requested": cfg.epochs,
         "run_forever": run_forever,
-        "completed_epochs": completed_epochs,
+        "completed_epochs": len(history),
         "backbone": cfg.backbone,
         "classes": class_names,
-        "history": history,
-        "best_checkpoint": str((cfg.models_dir / "best.pt").as_posix()),
-        "last_checkpoint": str((cfg.models_dir / "last.pt").as_posix()),
+        "early_stopping_patience": cfg.early_stopping_patience,
+        "fine_tuning_enabled": fine_tuning_enabled,
+        "class_weights": class_weights.cpu().tolist(),
     }
+
+    print(
+        f"Training done. Completed epochs={len(history)} | Best val_acc={best_val_acc:.4f} | Best val_loss={best_val_loss:.4f}"
+    )
+    summary["history"] = history
+    summary["best_checkpoint"] = str((cfg.models_dir / "best.pt").as_posix())
+    summary["last_checkpoint"] = str((cfg.models_dir / "last.pt").as_posix())
+
+    with (cfg.models_dir / "training_summary.json").open("w", encoding="utf-8") as fp:
+        json.dump(summary, fp, indent=2)
+
+    return summary
 
 
 def main() -> None:

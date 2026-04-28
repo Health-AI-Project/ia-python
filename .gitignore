@@ -4,4 +4,7 @@ __pycache__/
 .vscode/
 data/
 *.log
+.pytest_cache/
+.coverage
+.coverage.*
 

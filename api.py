@@ -17,6 +17,7 @@ from evaluate import evaluate_checkpoint
 from predict import predict_image
 from src.engine import load_checkpoint
 from src.nutrition import estimate_calories_for_class, estimate_weighted_calories
+from src.model import create_model, load_model_state
 from train import train_model
 
 app = FastAPI(
@@ -49,6 +50,7 @@ class TrainRequest(BaseModel):
     epochs: int = Field(default=5, ge=1, le=200)
     learning_rate: float = Field(default=1e-3, gt=0)
     fine_tune_learning_rate: float = Field(default=1e-4, gt=0)
+    weight_decay: float = Field(default=1e-4, ge=0)
     train_ratio: float = Field(default=0.7, gt=0, lt=1)
     val_ratio: float = Field(default=0.2, gt=0, lt=1)
     test_ratio: float = Field(default=0.1, gt=0, lt=1)
@@ -56,7 +58,16 @@ class TrainRequest(BaseModel):
     num_workers: int = Field(default=0, ge=0, le=8)
     backbone: str = Field(default="resnet18", pattern="^(resnet18|mobilenet_v3_small)$")
     no_pretrained: bool = False
+    dropout: float = Field(default=0.2, ge=0.0, le=0.9)
     unfreeze_epoch: int = Field(default=1, ge=0)
+    fine_tune_layers: int = Field(default=1, ge=1, le=10)
+    augmentations: bool = True
+    augmentation_strength: float = Field(default=0.2, ge=0.0, le=1.0)
+    label_smoothing: float = Field(default=0.0, ge=0.0, le=0.2)
+    early_stopping_patience: int = Field(default=3, ge=0)
+    early_stopping_min_delta: float = Field(default=1e-3, ge=0.0)
+    scheduler_factor: float = Field(default=0.5, gt=0.0, lt=1.0)
+    scheduler_patience: int = Field(default=1, ge=0)
     skip_split: bool = False
     bootstrap_demo_data: bool = False
 
@@ -67,6 +78,7 @@ class EvaluateRequest(BaseModel):
     image_size: int = Field(default=224, ge=32, le=1024)
     batch_size: int = Field(default=16, ge=1, le=256)
     num_workers: int = Field(default=0, ge=0, le=8)
+    output_dir: str = "models/evaluation"
 
 
 class PredictPathRequest(BaseModel):
@@ -74,6 +86,7 @@ class PredictPathRequest(BaseModel):
     image: str
     image_size: int = Field(default=224, ge=32, le=1024)
     top_k: int = Field(default=3, ge=1, le=20)
+    confidence_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class FeedbackRequest(BaseModel):
@@ -247,6 +260,7 @@ def _build_prediction_response(result: dict) -> dict:
     weighted_calories = estimate_weighted_calories(predictions)
     prediction_id = str(uuid4())
     created_at = datetime.now(timezone.utc).isoformat()
+    uncertain = bool(result.get("uncertain", False))
 
     enriched = {
         "prediction_id": prediction_id,
@@ -255,6 +269,9 @@ def _build_prediction_response(result: dict) -> dict:
         "checkpoint": result.get("checkpoint"),
         "predictions": predictions,
         "top_prediction": best_prediction,
+        "uncertain": uncertain,
+        "confidence_threshold": result.get("confidence_threshold"),
+        "status": result.get("status", "uncertain" if uncertain else "confident"),
         "calories": {
             "top1": top1_calories,
             "weighted_topk": weighted_calories,
@@ -273,7 +290,7 @@ def _build_prediction_response(result: dict) -> dict:
 def _to_namespace(payload: dict) -> argparse.Namespace:
     converted = {}
     for key, value in payload.items():
-        if key in {"raw_dir", "processed_dir", "models_dir", "checkpoint", "image"}:
+        if key in {"raw_dir", "processed_dir", "models_dir", "checkpoint", "image", "output_dir"}:
             converted[key] = Path(value)
         else:
             converted[key] = value
@@ -305,6 +322,12 @@ def model_status(checkpoint: str = "models/best.pt") -> dict:
 
     data = load_checkpoint(checkpoint_path, torch.device("cpu"))
     classes = data.get("class_names", [])
+    try:
+        model = create_model(data.get("backbone", "resnet18"), num_classes=len(classes), pretrained=False)
+        load_model_state(model, data.get("model_state", {}))
+        load_status = "ok"
+    except Exception as exc:
+        load_status = str(exc)
     return {
         "ready": True,
         "checkpoint": str(checkpoint_path),
@@ -313,6 +336,8 @@ def model_status(checkpoint: str = "models/best.pt") -> dict:
         "image_size": data.get("image_size"),
         "num_classes": len(classes),
         "class_names": classes,
+        "config": data.get("config", {}),
+        "load_status": load_status,
     }
 
 
@@ -362,6 +387,7 @@ async def predict_upload_endpoint(
     checkpoint: str = Form(default="models/best.pt"),
     image_size: int = Form(default=224),
     top_k: int = Form(default=3),
+    confidence_threshold: float = Form(default=0.5),
 ) -> dict:
     checkpoint_path = Path(checkpoint)
     if not checkpoint_path.exists():
@@ -380,6 +406,7 @@ async def predict_upload_endpoint(
             "image": str(temp_path),
             "image_size": image_size,
             "top_k": top_k,
+            "confidence_threshold": confidence_threshold,
         }
         result = predict_image(_to_namespace(payload))
         return _build_prediction_response(result)

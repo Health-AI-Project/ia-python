@@ -8,4 +8,6 @@ uvicorn
 python-multipart
 psycopg[binary]
 scikit-learn
+pytest
+pytest-cov
 

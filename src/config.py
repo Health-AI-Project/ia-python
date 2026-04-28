@@ -12,6 +12,7 @@ class TrainConfig:
     epochs: int = 5
     learning_rate: float = 1e-3
     fine_tune_learning_rate: float = 1e-4
+    weight_decay: float = 1e-4
     train_ratio: float = 0.7
     val_ratio: float = 0.2
     test_ratio: float = 0.1
@@ -19,7 +20,16 @@ class TrainConfig:
     num_workers: int = 0
     backbone: str = "resnet18"
     pretrained: bool = True
+    dropout: float = 0.2
     unfreeze_epoch: int = 1
+    fine_tune_layers: int = 1
+    augmentations: bool = True
+    augmentation_strength: float = 0.2
+    label_smoothing: float = 0.0
+    early_stopping_patience: int = 3
+    early_stopping_min_delta: float = 1e-3
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 1
 
 
 @dataclass
@@ -29,6 +39,7 @@ class EvalConfig:
     image_size: int = 224
     batch_size: int = 16
     num_workers: int = 0
+    output_dir: Path = Path("models/evaluation")
 
 
 @dataclass
@@ -37,4 +48,5 @@ class PredictConfig:
     image_path: Path
     image_size: int = 224
     top_k: int = 3
+    confidence_threshold: float = 0.5
 

@@ -5,12 +5,12 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from sklearn.metrics import classification_report
 
 from src.config import EvalConfig
 from src.data import build_dataloaders
 from src.engine import load_checkpoint
-from src.model import create_model
+from src.metrics import compute_classification_summary, export_evaluation_results
+from src.model import create_model, load_model_state
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--output-dir", type=Path, default=Path("models/evaluation"))
     return parser.parse_args()
 
 
@@ -30,17 +31,22 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict:
         image_size=args.image_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        output_dir=args.output_dir,
     )
 
     device = torch.device("cpu")
     checkpoint = load_checkpoint(cfg.checkpoint_path, device)
 
     _, _, test_loader, class_names = build_dataloaders(
-        cfg.processed_dir, cfg.image_size, cfg.batch_size, cfg.num_workers
+        cfg.processed_dir,
+        cfg.image_size,
+        cfg.batch_size,
+        cfg.num_workers,
+        augmentations=False,
     )
 
     model = create_model(checkpoint["backbone"], num_classes=len(class_names), pretrained=False)
-    model.load_state_dict(checkpoint["model_state"])
+    load_model_state(model, checkpoint["model_state"])
     model.to(device)
 
     criterion = nn.CrossEntropyLoss()
@@ -71,32 +77,27 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict:
     test_acc = total_correct / max(total_count, 1)
 
     if total_count > 0:
-        classification_report_text = classification_report(
-            all_targets,
-            all_predictions,
-            labels=list(range(len(class_names))),
-            target_names=class_names,
-            zero_division=0,
-        )
-        classification_report_dict = classification_report(
-            all_targets,
-            all_predictions,
-            labels=list(range(len(class_names))),
-            target_names=class_names,
-            output_dict=True,
-            zero_division=0,
-        )
+        advanced_metrics = compute_classification_summary(all_targets, all_predictions, class_names)
     else:
-        classification_report_text = "No test samples available."
-        classification_report_dict = {}
+        advanced_metrics = {
+            "confusion_matrix": [],
+            "classification_report_text": "No test samples available.",
+            "classification_report_dict": {},
+            "per_class": {},
+            "macro_avg": {},
+            "weighted_avg": {},
+            "most_confused_pairs": [],
+        }
 
     results = {
         "test_loss": test_loss,
         "test_acc": test_acc,
         "classes": class_names,
-        "classification_report": classification_report_text,
-        "classification_report_dict": classification_report_dict,
+        **advanced_metrics,
     }
+
+    export_paths = export_evaluation_results(results, cfg.output_dir)
+    results["exported_files"] = {key: str(value) for key, value in export_paths.items()}
     return results
 
 
@@ -105,7 +106,7 @@ def main() -> None:
     results = evaluate_checkpoint(args)
 
     print({"test_loss": results["test_loss"], "test_acc": results["test_acc"], "classes": results["classes"]})
-    print(results["classification_report"])
+    print(results["classification_report_text"])
 
 
 if __name__ == "__main__":
